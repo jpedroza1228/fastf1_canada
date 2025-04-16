@@ -1,0 +1,584 @@
+---
+title: "Winner Prediction"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+---
+
+# Loading Data
+
+```{python}
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotnine as pn
+import seaborn as sns
+import matplotlib.pyplot as plt
+from janitor import clean_names
+from matplotlib import rcParams
+import pyarrow as pa
+import pyarrow.parquet as pq
+import fastf1
+
+pd.set_option('mode.copy_on_write', True)
+pd.set_option('display.max_columns', None)
+rcParams.update({'savefig.bbox': 'tight'})
+```
+
+# Circuit Map
+
+```{python}
+#| eval: false
+#| echo: false
+
+def rotate(xy, *, angle):
+    """Rotate a DataFrame or Series of x/y points."""
+    rot_mat = np.array([[np.cos(angle), np.sin(angle)],
+                        [-np.sin(angle), np.cos(angle)]])
+    # xy can be a DataFrame (n, 2) or Series/list (2,)
+    if isinstance(xy, pd.DataFrame):
+        return xy @ rot_mat
+    else:  # assume it's Series or list-like with 2 elements
+        return pd.Series(xy) @ rot_mat
+```
+
+# Laps Data
+
+```{python}
+laps = pq.read_table('canada_laps.parquet')
+
+laps = laps.to_pandas()
+
+laps['lap_time_sec'] = laps['LapTime'].dt.total_seconds()
+laps['sector1_sec'] = laps['Sector1Time'].dt.total_seconds()
+laps['sector2_sec'] = laps['Sector2Time'].dt.total_seconds()
+laps['sector3_sec'] = laps['Sector3Time'].dt.total_seconds()
+
+laps['sector1_sessiontime_sec'] = laps['Sector1SessionTime'].dt.total_seconds()
+laps['sector2_sessiontime_sec'] = laps['Sector2SessionTime'].dt.total_seconds()
+laps['sector3_sessiontime_sec'] = laps['Sector3SessionTime'].dt.total_seconds()
+
+laps['pit_out_time_sec'] = laps['PitOutTime'].dt.total_seconds()
+laps['pit_in_time_sec'] = laps['PitInTime'].dt.total_seconds()
+
+laps['time_sec'] = laps['Time'].dt.total_seconds()
+
+laps = laps.sort_values(['Driver', 'LapNumber', 'year'], ascending = True)
+```
+
+# Weather Data
+
+```{python}
+weather = pq.read_table('canada_weather.parquet')
+
+weather = weather.to_pandas()
+
+weather = weather.drop(columns = 'time_sec')
+weather['time_sec'] = weather['Time'].dt.total_seconds()
+```
+
+# Car Data
+
+```{python}
+#| eval: false
+#| echo: false
+
+cardata = pq.read_table('canada_cardata.parquet')
+
+cardata = cardata.to_pandas()
+```
+
+# POS Data
+
+```{python}
+#| eval: false
+#| echo: false
+
+pos = pq.read_table('canada_pos.parquet')
+
+pos = pos.to_pandas()
+```
+
+```{python}
+#| eval: false
+#| echo: false
+
+can_24 = fastf1.get_session(2024, 'Canada', 'R')
+can_24.load()
+can_track = can_24.get_circuit_info()
+
+track_pos = pos.loc[:, ('X', 'Y')]
+
+track_angle = can_track.rotation / 180 * np.pi
+
+rotated_track = rotate(track_pos, angle = track_angle)
+
+rotated_track = rotated_track.loc[(rotated_track[0] != 0) & (rotated_track[1] != 0)]
+rotated_track['X'] = rotated_track[0]
+rotated_track['Y'] = rotated_track[1]
+rotated_track = rotated_track.drop(columns = [0, 1])
+
+offset_vector = pd.Series([500, 0]) 
+
+pn.ggplot.show(
+  pn.ggplot(rotated_track, pn.aes('X', 'Y'))
+  + pn.geom_path()
+) 
+```
+
+```{python}
+#| eval: false
+#| echo: false
+
+from great_tables import GT
+
+# Calculations & Table Creation
+fastest_lap = laps.groupby(['year', 'Driver', 'session'])['LapTime'].min().reset_index().sort_values(['session'])
+
+# laps.groupby(['year', 'Driver', 'session'])['LapNumber'].max().reset_index().sort_values('session')
+
+laps.loc[laps['LapTime'].isin(fastest_lap['LapTime']),
+['Driver', 'year', 'session', 'LapTime', 'LapNumber', 'Stint', 'Sector1Time', 
+'Sector2Time', 'Sector3Time', 'Compound', 'TyreLife', 'FreshTyre']].sort_values(
+  'session', 
+  ascending = True).drop_duplicates(
+    ['LapTime', 'Driver','session', 'year'])
+```
+
+```{python}
+laps.columns.tolist()
+
+weather.columns.tolist()
+
+# need to include pitlane delta
+
+laps = laps.sort_values(['session', 'Driver', 'year'])
+
+laps['has_pit_out'] = np.where(laps['pit_out_time_sec'].isna(), 0, 1)
+laps['has_pit_in'] = np.where(laps['pit_in_time_sec'].isna(), 0, 1)
+
+laps.head()
+
+pn.ggplot.show(
+  pn.ggplot(laps.melt(id_vars = ['Driver', 'session', 'year'],
+  value_vars = ['has_pit_out', 'has_pit_in']),
+  pn.aes('value'))
+  + pn.geom_bar(pn.aes(fill = 'factor(variable)'), color = 'black', position = 'dodge')
+  + pn.facet_grid('session', 'Driver', scales = 'free')
+  + pn.theme_classic()
+)
+
+laps[['pit_out_time_sec', 'pit_in_time_sec']] = laps[['pit_out_time_sec', 'pit_in_time_sec']].fillna(0)
+laps['pit_in_time_sec_shift'] = laps['pit_in_time_sec'].shift(1)
+laps['pit_in_time_sec_shift'] = laps['pit_in_time_sec_shift'].fillna(0)
+
+laps.head()
+
+laps['pit_delta'] = laps['pit_out_time_sec'] - laps['pit_in_time_sec_shift']
+
+laps[['session', 'year', 'Driver', 'LapNumber', 'pit_out_time_sec', 'pit_in_time_sec', 'pit_in_time_sec_shift', 'pit_delta']].sort_values(['session', 'year', 'Driver', 'LapNumber'])
+
+laps.columns.tolist()
+
+laps.head()
+weather.head()
+
+laps['time_join'] = laps['time_sec'].round(0)
+```
+
+```{python}
+weather['time_start'] = weather['time_sec'].round(0)
+weather['time_end'] = weather['time_start'].shift(-1).fillna(0)
+
+weather['interval'] = weather.groupby(['session', 'year']).cumcount() + 1
+
+weather
+```
+
+```{python}
+def match_intervals_grouped(df1, df2):
+    matched_rows = []
+
+    # Group both dataframes by year and session
+    for (year, session), group1 in df1.groupby(['year', 'session']):
+        group2 = df2[(df2['year'] == year) & (df2['session'] == session)]
+
+        # For each row in df1 group, find matching interval in df2
+        for _, row in group1.iterrows():
+            value = row['time_join']
+            matched = group2[(group2['time_start'] <= value) & (value < group2['time_end'])]
+            if not matched.empty:
+                interval_id = matched.iloc[0]['interval']
+            else:
+                interval_id = None
+
+            row_out = row.copy()
+            row_out['interval'] = interval_id
+            matched_rows.append(row_out)
+
+    return pd.DataFrame(matched_rows)
+
+# Apply matching
+match_data = match_intervals_grouped(laps, weather)
+```
+
+```{python}
+match_data = match_data.merge(weather, 'left', ['session', 'year', 'interval'])
+
+match_data.columns.tolist()
+```
+
+```{python}
+model_laps = match_data.loc[:, ['Driver', 'LapNumber', 'session', 'year', 'interval',
+'Stint', 'SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST',
+'Compound', 'TyreLife', 'FreshTyre', 'time_sec_x',
+'lap_time_sec', 'sector1_sec', 'sector2_sec', 'sector3_sec',
+'sector1_sessiontime_sec', 'sector2_sessiontime_sec', 'sector3_sessiontime_sec',
+'pit_out_time_sec', 'pit_in_time_sec', 'has_pit_out', 'has_pit_in',
+'pit_in_time_sec_shift', 'pit_delta', 'time_join',
+'interval', 'AirTemp', 'Humidity', 'Pressure',
+'Rainfall', 'TrackTemp', 'WindDirection',
+'WindSpeed',
+'Position']]
+
+model_laps.head()
+
+```
+
+## Lap Visualizations
+
+```{python}
+#| eval: false
+#| echo: false
+
+model_laps.groupby(['year', 'Driver', 'Compound', 'FreshTyre', 'session'])[['lap_time_sec', 'sector1_sec', 'sector2_sec', 'sector3_sec']].min().reset_index()
+
+pn.ggplot.show(
+  pn.ggplot(
+    model_laps.groupby(
+      ['year', 'LapNumber','Driver', 'Compound', 'FreshTyre', 'session'])[['lap_time_sec', 'sector1_sec', 'sector2_sec', 'sector3_sec']].min().reset_index().melt(
+        id_vars = ['year', 'LapNumber', 'Driver', 'Compound', 'FreshTyre', 'session'], 
+        value_vars = ['lap_time_sec', 'sector1_sec', 'sector2_sec', 'sector3_sec']),
+        pn.aes('LapNumber', 'value'))
+  + pn.geom_line(pn.aes(color = 'Driver', group = 'Driver'))
+  + pn.geom_point(pn.aes(shape = 'Compound'), alpha = .7)
+  + pn.facet_grid('variable', 'session', scales = 'free')
+  + pn.theme_classic()
+)
+
+model_laps.groupby(['year', 'Driver', 'Compound', 'FreshTyre', 'session'])[['SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST']].max().reset_index()
+
+#pn.ggplot.show(
+#  pn.ggplot(laps_sub.groupby(['year', 'LapNumber','Driver', 'Compound', 'FreshTyre', 'session'])[['SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST']].max().reset_index().melt(id_vars = ['year', 'LapNumber', 'Driver', 'Compound', 'FreshTyre', 'session'], value_vars = ['SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST']),
+#  pn.aes('LapNumber', 'value'))
+#  + pn.geom_line(pn.aes(color = 'Driver', group = 'Driver'))
+#  + pn.geom_point(pn.aes(shape = 'Compound'), alpha = .7)
+#  + pn.scale_shape_manual(values = ['v', '*', 'o', '+'])
+#  + pn.facet_grid('variable', 'session', scales = 'free')
+#  + pn.theme_classic()
+#)
+```
+
+```{python}
+
+model_laps
+
+# impute with mean value
+model_laps.loc[(model_laps.isna().any(axis = 1))]
+
+model_laps.loc[(model_laps['SpeedI1'].isna())]
+
+model_laps.loc[(model_laps['SpeedI1'].isna()), 'SpeedI1'].isna().sum()
+
+mean_imp = model_laps.groupby(
+    ['Driver', 'session', 'year'])[['SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST', 'sector1_sec', 'sector2_sec', 'sector3_sec']].transform(
+      lambda x: x.fillna(x.mean()))
+
+model_laps = model_laps.drop(columns = ['SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST', 'sector1_sec', 'sector2_sec', 'sector3_sec']).join(mean_imp)
+
+model_laps.info()
+
+model_laps.loc[(model_laps.isna().any(axis = 1))]
+
+# model_laps['sector2_sessiontime_sec'] = model_laps['sector2_sessiontime_sec'].fillna(model_laps['sector1_sessiontime_sec'] + model_laps['sector2_sec'])
+# model_laps['sector3_sessiontime_sec'] = model_laps['sector3_sessiontime_sec'].fillna(model_laps['sector2_sessiontime_sec'] + model_laps['sector3_sec'])
+model_laps['lap_time_sec'] = model_laps['lap_time_sec'].fillna(model_laps['sector1_sec'] + model_laps['sector2_sec'] + model_laps['sector3_sec'])
+
+model_laps.loc[(model_laps.isna().any(axis = 1))]
+
+model_laps.columns.tolist()
+```
+
+```{python}
+#| eval: false
+#| echo: false
+
+model_var_corr = model_laps.loc[:, ['sector1_sessiontime_sec', 'sector2_sessiontime_sec', 'sector3_sessiontime_sec', 'lap_time_sec']].corr()
+
+corr_bot_only = np.triu(np.ones_like(model_var_corr, dtype = bool))
+
+plt.clf()
+
+sns.heatmap(model_var_corr, mask = corr_bot_only, annot = True)
+plt.show()
+```
+
+```{python}
+model_laps = model_laps.drop(columns = ['time_sec_x', 'sector1_sessiontime_sec', 'sector2_sessiontime_sec', 'sector3_sessiontime_sec', 'pit_in_time_sec'])
+
+model_laps.loc[(model_laps.isna().any(axis = 1))]
+
+model_laps['Position'] = model_laps['Position'].fillna(20)
+```
+
+# Modeling
+
+```{python}
+model_laps.info()
+model_laps.head()
+
+model_laps['NOR'] = pd.get_dummies(model_laps['Driver'], dtype = 'float64').iloc[:, 0]
+model_laps[['fp1', 'fp2', 'fp3', 'q', 'r']] = pd.get_dummies(model_laps['session'], dtype = 'float64')
+model_laps[['hard', 'intermediate', 'medium', 'soft', 'wet']] = pd.get_dummies(model_laps['Compound'], dtype = 'float64')
+model_laps['fresh_tires'] = pd.get_dummies(model_laps['FreshTyre'], dtype = 'float64').iloc[:, 1]
+model_laps['rain'] = pd.get_dummies(model_laps['Rainfall'], dtype = 'float64').iloc[:, 1]
+
+model_laps.info()
+
+np.corrcoef(model_laps['sector1_sec'], model_laps['lap_time_sec'])
+np.corrcoef(model_laps['sector2_sec'], model_laps['lap_time_sec'])
+np.corrcoef(model_laps['sector3_sec'], model_laps['lap_time_sec'])
+
+np.corrcoef(model_laps['sector1_sec'], model_laps['Position'])
+np.corrcoef(model_laps['sector2_sec'], model_laps['Position'])
+np.corrcoef(model_laps['sector3_sec'], model_laps['Position'])
+np.corrcoef(model_laps['lap_time_sec'], model_laps['Position'])
+
+
+model_laps = model_laps.drop(
+  columns = ['Driver', 'session', 'Compound', 'FreshTyre', 'Rainfall'])
+
+model_laps.head()
+
+# Should be Cleaning Data For FP laps that drop off to save tires and fuel
+# model_laps = model_laps.loc[(fp1_laps_sub['LapNumber'] != 26)]
+
+model_laps = model_laps.dropna()
+
+model_laps_train = model_laps.loc[((model_laps['year'].isin([2022, 2023])) & (model_laps['r'] == 1)) | ((model_laps['year'] != 2024) & (model_laps['r'] != 1))]
+model_laps_test = model_laps.loc[((model_laps['year'] == 2024) & (model_laps['r'] == 1))]
+
+x_train = model_laps_train.drop(columns = 'Position')
+x_test = model_laps_test.drop(columns = 'Position')
+
+y_train = model_laps_train['Position']
+y_test = model_laps_test['Position']
+
+# y_train = pd.Categorical(y_train, ordered = True)
+# y_test = pd.Categorical(y_test, ordered = True)
+
+```
+
+# Keras Model
+
+```{python}
+from tensorflow.random import set_seed
+from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error, roc_curve, make_scorer, log_loss, confusion_matrix
+import tensorflow as tf
+from tensorflow import keras
+import keras_tuner as kt
+#from keras.utils import FeatureSpace
+from sklearn.utils.class_weight import compute_class_weight
+import tensorflow.keras.models as keras_model
+from tensorflow.keras.regularizers import l1_l2
+from tensorflow.keras.layers import Dense, Dropout, LeakyReLU, BatchNormalization, LayerNormalization
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.metrics import SparseCategoricalAccuracy
+from tensorflow.keras.losses import SparseCategoricalCrossentropy
+
+num_classes = np.unique(y_train)
+
+class_wt = compute_class_weight('balanced', classes = num_classes, y = y_train)
+class_wt = dict(enumerate(class_wt))
+
+y_train_nn = np.array(y_train)
+y_test_nn = np.array(y_test)
+
+y_train_nn = y_train_nn - 1
+y_test_nn = y_test_nn - 1
+
+x_train_nn = np.array(x_train)
+x_test_nn = np.array(x_test)
+
+np.unique(y_train_nn)
+
+num_classes
+```
+
+```{python}
+set_seed(14042025)
+nn = keras_model.Sequential([
+    Dense(64, activation = 'relu', input_shape = (x_train.shape[1],)),
+    #BatchNormalization(),
+    LayerNormalization(),
+    Dropout(.3),
+    Dense(32, activation = 'relu'),
+    #BatchNormalization(),
+    LayerNormalization(),
+    Dropout(.3),
+    Dense(16, activation = 'relu'),
+    #BatchNormalization(),
+    LayerNormalization(),
+    Dropout(.3),
+    Dense(20, activation = 'softmax')
+])
+
+# kernel_initializer='he_normal'
+
+# Compile model
+nn.compile(
+  optimizer = tf.keras.optimizers.AdamW(0.001),
+  loss = [SparseCategoricalCrossentropy()],
+  metrics = [SparseCategoricalAccuracy()])
+
+nn.summary()
+```
+
+```{python}
+# Train model
+set_seed(14042025)
+nn.fit(x_train_nn, y_train_nn, epochs = 100, batch_size = 32, class_weight = class_wt)
+nn.evaluate(x_test_nn, y_test_nn)
+
+# Sparse Categorical Cross Entropy = 1.55
+# Sparse Categorical Accuracy = .566
+```
+
+```{python}
+set_seed(14042025)
+def build_model(hp):
+    model = keras_model.Sequential()
+
+    hp_unit1 = hp.Choice("units", values = [64, 128, 256, 512])
+    hp_l1 = hp.Float('l1_pen', min_value = 0, max_value = 1, step = .1, default = 0)
+    hp_l2 = hp.Float('l2_pen', min_value = 0, max_value = 1, step = .1, default = 0)
+    model.add(Dense(hp_unit1, activation = 'relu', kernel_regularizer = l1_l2(l1 = hp_l1, l2 = hp_l2), input_shape = (x_train.shape[1],)))
+    model.add(LayerNormalization())
+    hp_dropout = hp.Float('dropout', min_value = .2, max_value = .7, step = .1, default = .2)
+    model.add(Dropout(hp_dropout))
+
+    hp_unit2 = hp.Choice("units2", values = [32, 64, 128, 256])
+    model.add(Dense(hp_unit2, activation = 'relu', kernel_regularizer = l1_l2(l1 = hp_l1, l2 = hp_l2)))
+    model.add(LayerNormalization())
+    model.add(Dropout(hp_dropout))
+
+    hp_unit3 = hp.Choice("units3", values = [2, 4, 8, 16, 32, 64, 128])
+    model.add(Dense(hp_unit3, activation = 'relu', kernel_regularizer = l1_l2(l1 = hp_l1, l2 = hp_l2)))
+    model.add(LayerNormalization())
+    model.add(Dropout(hp_dropout))
+
+    model.add(Dense(20, activation = 'softmax'))
+
+    learn_rate = hp.Float("learning_rate", min_value = .0001, max_value = .01, step = .01)
+
+    model.compile(
+      optimizer = tf.keras.optimizers.AdamW(learning_rate = learn_rate),
+      loss = [SparseCategoricalCrossentropy()],
+      metrics = [SparseCategoricalAccuracy()])
+
+    return model
+```
+
+```{python}
+set_seed(14042025)
+tuner = kt.RandomSearch(
+  build_model,
+  objective = 'sparse_categorical_accuracy',
+  max_trials = 10,
+  executions_per_trial = 1,
+  project_name = 'tuned_gp'
+)
+
+set_seed(14042025)
+tuner.search(x_train_nn,
+             y_train_nn,
+             #validation_split=0.2,
+             epochs = 100,
+             batch_size = 32,
+             class_weight = class_wt,
+             callbacks = [keras.callbacks.EarlyStopping(patience = 5)])
+```
+
+```{python}
+best_model = tuner.get_best_models(num_models = 1)[0]
+best_hps = tuner.get_best_hyperparameters(1)[0]
+
+set_seed(14042025)
+best_model.evaluate(x_test_nn, y_test_nn)
+# Sparse Categorical Cross Entropy = 31.48
+# Sparse Categorical Accuracy = .545
+
+best_hps.values
+```
+
+```{python}
+y_pred = nn.predict(x_test_nn)
+
+# Convert predicted probabilities to class labels
+y_pred_label = np.argmax(y_pred, axis=1)
+
+# Get the confusion matrix
+# cm = confusion_matrix(y_train_nn, y_pred_label)
+
+# plt.clf()
+# sns.heatmap(cm, annot = True, cbar = False)
+# plt.show()
+```
+
+# Random Forest Classifier
+
+```{python}
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.ensemble import RandomForestClassifier as rfc, GradientBoostingClassifier as gbc
+from sklearn.utils import shuffle
+
+# Need class 
+
+y_train_bi = np.where(y_train == 1, 1, 0)
+y_test_bi = np.where(y_test == 1, 1, 0)
+
+rf_model = rfc(
+  criterion = 'log_loss',
+  n_estimators = 1000,
+  min_samples_split = 2,
+  max_depth = 10,
+  random_state = 14042025, 
+  verbose = 2,
+  class_weight = 'balanced')
+
+rf_model.fit(x_train, y_train_bi)
+
+rf_pred = rf_model.predict(x_test)
+
+confusion_matrix(y_test_bi, rf_pred)
+accuracy_score(y_test_bi, rf_pred)
+roc_auc_score(y_test_bi, rf_pred)
+
+boost_model = gbc(
+  loss = 'log_loss',
+  n_estimators = 1000,
+  max_depth = 10,
+  random_state = 14042025, 
+  verbose = 2,
+  learning_rate = .0001
+)
+
+boost_model.fit(x_train, y_train_bi)
+
+boost_pred = boost_model.predict(x_test)
+
+confusion_matrix(y_test_bi, boost_pred)
+accuracy_score(y_test_bi, boost_pred)
+roc_auc_score(y_test_bi, boost_pred)
+```
