@@ -1,0 +1,850 @@
+---
+title: "GP Analyses"
+format: 
+  html:
+    toc: 2
+---
+
+# Parameters
+
+```{python}
+#| tags: [parameters]
+
+track_loc = 'Canada'
+track_loc = track_loc.lower()
+pole22 = 'VER'
+pole23 = 'VER'
+pole24 = 'RUS'
+```
+
+# Loading Data
+
+```{python}
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotnine as pn
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+pd.set_option('mode.copy_on_write', True)
+pd.set_option('display.max_columns', None)
+rcParams.update({'savefig.bbox': 'tight'})
+```
+
+# Loading Data
+
+```{python}
+driver_number22 = ['1', '3', '4', '5', '6', '10', '11', '14', '16', '18', '20', '22', '23', '24', '31', '44', '47', '55', '63', '77']
+
+driver_number23 = ['1', '2', '4', '10', '11', '14', '16', '18', '20', '21', '22', '23', '24', '27', '31', '44', '55', '63', '77', '81']
+
+driver_number24 = ['1', '2', '3', '4', '10', '11', '14', '16', '18', '20', '22', '23', '24', '27', '44', '55', '61', '63', '77', '81']
+driver_number24_2 = ['1', '2', '3', '4', '10', '11', '14', '16', '18', '20', '22', '23', '24', '27', '31', '44', '55', '63', '77', '81']
+
+driver_number22 = [int(x) for x in driver_number22]
+driver_number23 = [int(x) for x in driver_number23]
+driver_number24 = [int(x) for x in driver_number24]
+driver_number24_2 = [int(x) for x in driver_number24_2]
+```
+
+# Laps Data
+
+```{python}
+laps = pq.read_table(f'data/{track_loc}_laps.parquet')
+laps = laps.to_pandas()
+
+laps['lap_time_sec'] = laps['LapTime'].dt.total_seconds()
+laps['sector1_sec'] = laps['Sector1Time'].dt.total_seconds()
+laps['sector2_sec'] = laps['Sector2Time'].dt.total_seconds()
+laps['sector3_sec'] = laps['Sector3Time'].dt.total_seconds()
+laps['sector1_sessiontime_sec'] = laps['Sector1SessionTime'].dt.total_seconds()
+laps['sector2_sessiontime_sec'] = laps['Sector2SessionTime'].dt.total_seconds()
+laps['sector3_sessiontime_sec'] = laps['Sector3SessionTime'].dt.total_seconds()
+laps['pit_out_time_sec'] = laps['PitOutTime'].dt.total_seconds()
+laps['pit_in_time_sec'] = laps['PitInTime'].dt.total_seconds()
+laps['time_sec'] = laps['Time'].dt.total_seconds()
+
+laps = laps.sort_values(['Driver', 'LapNumber', 'year'], ascending = True)
+
+laps['has_pit_out'] = np.where(laps['pit_out_time_sec'].isna(), 0, 1)
+laps['has_pit_in'] = np.where(laps['pit_in_time_sec'].isna(), 0, 1)
+
+laps[['pit_out_time_sec', 'pit_in_time_sec']] = laps[['pit_out_time_sec', 'pit_in_time_sec']].fillna(0)
+laps['pit_in_time_sec_shift'] = laps['pit_in_time_sec'].shift(1)
+laps['pit_in_time_sec_shift'] = laps['pit_in_time_sec_shift'].fillna(0)
+
+laps['pit_delta'] = laps['pit_out_time_sec'] - laps['pit_in_time_sec_shift']
+
+laps['time_join'] = laps['time_sec'].round(0)
+```
+
+# Weather Data
+
+```{python}
+weather = pq.read_table(f'data/{track_loc}_weather.parquet')
+weather = weather.to_pandas()
+
+weather = weather.drop(columns = 'time_sec')
+weather['time_sec'] = weather['Time'].dt.total_seconds()
+
+weather['time_start'] = weather['time_sec'].round(0)
+weather['time_end'] = weather['time_start'].shift(-1).fillna(0)
+weather['interval'] = weather.groupby(['session', 'year']).cumcount() + 1
+```
+
+```{python}
+def match_intervals_grouped(df1, df2):
+    matched_rows = []
+
+    # Group both dataframes by year and session
+    for (year, session), group1 in df1.groupby(['year', 'session']):
+        group2 = df2[(df2['year'] == year) & (df2['session'] == session)]
+
+        # For each row in df1 group, find matching interval in df2
+        for _, row in group1.iterrows():
+            value = row['time_join']
+            matched = group2[(group2['time_start'] <= value) & (value < group2['time_end'])]
+            if not matched.empty:
+                interval_id = matched.iloc[0]['interval']
+            else:
+                interval_id = None
+
+            row_out = row.copy()
+            row_out['interval'] = interval_id
+            matched_rows.append(row_out)
+
+    return pd.DataFrame(matched_rows)
+
+# Apply matching
+match_data = match_intervals_grouped(laps, weather)
+
+match_data = match_data.merge(weather, 'left', ['session', 'year', 'interval'])
+
+match_data['lap_start_time_sec'] = match_data['LapStartTime'].dt.total_seconds()
+match_data['lap_start_date'] = match_data['LapStartDate'].dt.date
+match_data['lap_start_dt_time'] = match_data['LapStartDate'].dt.time
+
+match_data = match_data.drop(columns = ['Time_x', 'LapTime', 'PitOutTime', 'PitInTime', 'Sector1Time', 'Sector2Time', 'Sector3Time', 'Sector1SessionTime', 'Sector2SessionTime', 'Sector3SessionTime', 'IsPersonalBest', 'LapStartTime', 'LapStartDate', 'Time_y', 'DeletedReason', 'FastF1Generated', 'IsAccurate'])
+```
+
+```{python}
+model_laps = match_data.loc[:, ['Driver', 'DriverNumber', 'LapNumber', 'session', 'year', 'interval',
+'Stint', 'SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST',
+'Compound', 'TyreLife', 'FreshTyre', 'time_sec_x',
+'lap_time_sec', 'sector1_sec', 'sector2_sec', 'sector3_sec',
+'sector1_sessiontime_sec', 'sector2_sessiontime_sec', 'sector3_sessiontime_sec',
+'pit_out_time_sec', 'pit_in_time_sec', 'has_pit_out', 'has_pit_in',
+'pit_in_time_sec_shift', 'pit_delta', 'time_join',
+'interval', 'AirTemp', 'Humidity', 'Pressure',
+'Rainfall', 'TrackTemp', 'WindDirection',
+'WindSpeed',
+'Position']]
+
+mean_imp = model_laps.groupby(
+    ['Driver', 'session', 'year'])[['SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST', 'sector1_sec', 'sector2_sec', 'sector3_sec']].transform(
+      lambda x: x.fillna(x.mean()))
+
+model_laps = model_laps.drop(columns = ['SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST', 'sector1_sec', 'sector2_sec', 'sector3_sec']).join(mean_imp)
+
+model_laps['lap_time_sec'] = model_laps['lap_time_sec'].fillna(model_laps['sector1_sec'] + model_laps['sector2_sec'] + model_laps['sector3_sec'])
+
+model_laps = model_laps.drop(columns = ['sector1_sessiontime_sec', 'sector2_sessiontime_sec', 'sector3_sessiontime_sec', 'pit_in_time_sec'])
+
+model_laps['Position'] = model_laps['Position'].fillna(20)
+
+mean_imp_gen = model_laps.groupby(
+    ['session', 'year'])[['lap_time_sec', 'SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST', 'sector1_sec', 'sector2_sec', 'sector3_sec']].transform(
+      lambda x: x.fillna(x.mean()))
+
+model_laps = model_laps.drop(columns = ['lap_time_sec', 'SpeedI1', 'SpeedI2', 'SpeedFL', 'SpeedST', 'sector1_sec', 'sector2_sec', 'sector3_sec']).join(mean_imp_gen)
+```
+
+```{python}
+model_laps.loc[(model_laps.isna().any(axis = 1))]
+```
+
+# EDA
+
+```{python}
+(
+  model_laps
+  .loc[(model_laps['session'] == 'q') & (model_laps['Driver'] == 'VER'),
+  ['Driver', 'time_sec_x', 'lap_time_sec']]
+  .sort_values('time_sec_x', ascending = True)
+)
+
+model_laps.head()
+
+model_laps['time_min'] = model_laps['time_sec_x']/60
+model_laps['pit_out_time_min'] = model_laps['pit_out_time_sec']/60
+model_laps['pit_in_time_shift_min'] = model_laps['pit_in_time_sec_shift']/60
+model_laps['lap_min'] = model_laps['lap_time_sec']/60
+
+
+model_laps22 = model_laps.loc[(model_laps['year'] == 2022)]
+model_laps23 = model_laps.loc[(model_laps['year'] == 2023)]
+model_laps24 = model_laps.loc[(model_laps['year'] == 2024)]
+
+# what section of qualifying did the driver get to
+model_laps22['final_q'] = (
+  np
+  .select(
+    [
+      model_laps22['Driver'].isin(['VER', 'ALO', 'SAI', 'HAM', 'MAG', 'SCH', 'OCO', 'RUS', 'RIC', 'ZHO']),
+      model_laps22['Driver'].isin(['VER', 'ALO', 'SAI', 'HAM', 'MAG', 'SCH', 'OCO', 'RUS', 'RIC', 'ZHO', 'BOT', 'ALB', 'PER', 'NOR']),
+      model_laps22['Driver'].isin(['VER', 'ALO', 'SAI', 'HAM', 'MAG', 'SCH', 'OCO', 'RUS', 'RIC', 'ZHO', 'BOT', 'ALB', 'PER', 'NOR', 'LEC', 'GAS', 'VET', 'STR', 'LAT', 'TSU'])
+    ],
+    ['q3', 'q2', 'q1'],
+    default = 'q1'
+  )
+  .astype('object')
+)
+
+model_laps23['final_q'] = (
+  np
+  .select(
+    [
+      model_laps23['Driver'].isin(['VER', 'HUL', 'ALO', 'HAM', 'RUS', 'OCO', 'NOR', 'SAI', 'PIA', 'ALB']),
+      model_laps23['Driver'].isin(['VER', 'HUL', 'ALO', 'HAM', 'RUS', 'OCO', 'NOR', 'SAI', 'PIA', 'ALB', 'LEC', 'PER', 'STR',
+      'MAG', 'BOT']),
+      model_laps23['Driver'].isin(['VER', 'HUL', 'ALO', 'HAM', 'RUS', 'OCO', 'NOR', 'SAI', 'PIA', 'ALB', 'LEC', 'PER', 'STR',
+      'MAG', 'BOT', 'TSU', 'GAS', 'DEV', 'SAR', 'ZHO'])
+    ],
+    ['q3', 'q2', 'q1'],
+    default = 'q1'
+  )
+  .astype('object')
+)
+
+model_laps24['final_q'] = (
+  np
+  .select(
+    [
+      model_laps24['Driver'].isin(['RUS', 'VER', 'NOR', 'PIA', 'RIC', 'ALO', 'HAM', 'TSU', 'STR', 'ALB']),
+      model_laps24['Driver'].isin(['RUS', 'VER', 'NOR', 'PIA', 'RIC', 'ALO', 'HAM', 'TSU', 'STR', 'ALB', 'LEC', 'SAI',
+      'SAR', 'MAG', 'GAS']),
+      model_laps24['Driver'].isin(['RUS', 'VER', 'NOR', 'PIA', 'RIC', 'ALO', 'HAM', 'TSU', 'STR', 'ALB', 'LEC', 'SAI',
+      'SAR', 'MAG', 'GAS', 'PER', 'BOT', 'OCO', 'HUL', 'ZHO'])
+    ],
+    ['q3', 'q2', 'q1'],
+    default = 'q1'
+  )
+  .astype('object')
+)
+
+
+# pole sitter
+model_laps22['pole_sitter'] = (
+  np
+  .select(
+    [
+      (model_laps22['Driver'] == pole22),
+      (model_laps22['Driver'] != pole22)
+    ],
+    [1, 0]
+  )
+)
+
+model_laps23['pole_sitter'] = (
+  np
+  .select(
+    [
+      (model_laps23['Driver'] == pole23),
+      (model_laps23['Driver'] != pole23)
+    ],
+    [1, 0]
+  )
+)
+
+model_laps24['pole_sitter'] = (
+  np
+  .select(
+    [
+      (model_laps24['Driver'] == pole24),
+      (model_laps24['Driver'] != pole24)
+    ],
+    [1, 0]
+  )
+)
+```
+
+```{python}
+model_laps = pd.concat([model_laps22, model_laps23, model_laps24])
+
+model_laps.head()
+```
+
+```{python}
+
+model_laps.loc[(model_laps['session'] == 'q')].groupby(['year'])[['final_q', 'pole_situtter']].value_counts(normalize = True).reset_index()
+
+qual_results = (
+  model_laps
+  .loc[(model_laps['session'] == 'q')]
+	.groupby(['year', 'Driver', 'final_q'])['lap_time_sec']
+	.min()
+	.reset_index()
+	.sort_values(['year', 'final_q', 'lap_time_sec'], ascending = [True, False, True])
+)
+
+qual_results['final_q'] = pd.Categorical(qual_results['final_q'], ordered = True, categories = ['q1', 'q2', 'q3'])
+#qual_results['year'] = pd.Categorical(qual_results['year'], ordered = True, categories = [2022, 2023, 2024])
+#qual_results['Driver'] = pd.Categorical(qual_results['Driver'], categories = ['VER', 'ALO', 'SAI', 'HAM', 'MAG', 'SCH', 'OCO', 'RUS', 'RIC', 'ZHO', 'BOT', 'ALB', 'PER', 'NOR', 'LEC', 'GAS', 'VET', 'STR', 'LAT', 'TSU'])
+
+pn.ggplot.show(
+  pn.ggplot(qual_results, pn.aes('Driver', 'lap_time_sec/60'))
+  + pn.geom_col(pn.aes(fill = 'final_q'))
+  + pn.coord_flip()
+  + pn.facet_wrap('year', scales = 'free')
+  + pn.labs(x = '', y = 'Lap Time')
+  + pn.theme_classic()
+)
+```
+
+```{python}
+#model_laps[pd.get_dummies(model_laps['Driver'], dtype = 'float64').columns] = pd.get_dummies(model_laps['Driver'], dtype = 'float64')
+# removed driver number because it correlates completely to the Driver column
+# model_laps[pd.get_dummies(model_laps['DriverNumber'], dtype = 'float64').columns] = pd.get_dummies(model_laps['DriverNumber'], dtype = 'float64')
+# model_laps[['fp1', 'fp2', 'fp3', 'q', 'r']] = pd.get_dummies(model_laps['session'], dtype = 'float64')
+model_laps[['hard', 'intermediate', 'medium', 'soft', 'wet']] = pd.get_dummies(model_laps['Compound'], dtype = 'float64')
+model_laps['fresh_tires'] = pd.get_dummies(model_laps['FreshTyre'], dtype = 'float64').iloc[:, 1]
+model_laps['rain'] = pd.get_dummies(model_laps['Rainfall'], dtype = 'float64').iloc[:, 1]
+# model_laps[['q1', 'q2', 'q3']] = pd.get_dummies(model_laps['final_q'], dtype = 'float64')
+
+model_laps.head()
+model_laps.columns.tolist()
+
+model_laps = (
+  model_laps
+  .drop(columns = ['Driver', 'DriverNumber', 'Compound', 'FreshTyre', 'Rainfall', 'time_join',
+  'time_sec_x', 'pit_out_time_sec', 'pit_in_time_sec_shift', 'lap_time_sec', 'final_q'])
+)
+
+
+
+work = model_laps.loc[(model_laps['year'].isin([2022, 2023]))]
+work['position_bi'] = np.where(work['Position'] == 1, 1, 0)
+
+work.head()
+work.columns.tolist()
+
+
+work_mod = work.loc[:, ['LapNumber', 'year', 'Stint',
+'TyreLife', 'pit_delta', 'Humidity', 'TrackTemp',
+'WindSpeed', 'SpeedI1', 'SpeedI2', 'SpeedFL',
+'SpeedST', 'sector1_sec', 'sector2_sec', 'sector3_sec',
+'lap_min', 'pole_sitter', 'session',
+'hard', 'intermediate', 'medium', 'soft', 'wet', 'fresh_tires',
+'rain', 'position_bi']]
+work_mod = work_mod.dropna()
+
+work_mod.head()
+
+#interval_df = work.filter(regex = 'interval')
+#work_mod = work_mod.drop(columns = interval_df.columns)
+#work_mod['interval'] = interval_df.iloc[:, 0]
+
+work_mod.columns.tolist()
+
+work_mod['session_up'] = (
+  np.select(
+    [
+      (work_mod['session'].isin(['fp1', 'fp2', 'fp3'])),
+      (work_mod['session'] == 'q'),
+      (work_mod['session'] == 'r')
+    ],
+    ['fp', 'q', 'r'],
+    default = 'fp'
+  ).astype('object')
+)
+
+work_mod[['fp', 'q', 'r']] = pd.get_dummies(work_mod['session_up'], dtype = 'float64')
+
+work_mod.columns.tolist()
+
+work_mod = work_mod.drop(columns = ['session', 'session_up', 'fp', 'Humidity', 'soft', 'TrackTemp'])
+
+work_mod_corr = work_mod.corr()
+
+work_mod_corr.loc[:, 'position_bi']
+
+x = work_mod.drop(columns = 'position_bi')
+y = work_mod['position_bi']
+```
+
+```{python}
+#| eval: false
+#| echo: false
+
+work_mod.head()
+work_mod.columns
+
+import statsmodels.formula.api as smf
+
+var = 'intermediate'
+mod1 = 'TyreLife'
+#mod2 = 'pole_sitter'
+#mod2 = 'year'
+
+work_mod['both'] = work_mod[var]*work_mod[mod1]
+
+(
+  print(
+    work_mod[[var, mod1, 'both', 'position_bi']]
+    .corr()
+  )
+)
+
+pn.ggplot.show(
+  pn.ggplot(work_mod, pn.aes(var, 'position_bi'))
+  + pn.geom_point(alpha = .3)
+  + pn.geom_smooth(method = "glm",
+  method_args={'family': 'binomial'},
+  se = False)
+  + pn.facet_wrap(mod1)
+  #+ pn.facet_grid(mod1, mod2)
+)
+
+mod = smf.glm(formula = f'position_bi ~ {var}*{mod1}',
+              #formula = f'position_bi ~ {var}*{mod1} + {var}*{mod2}',
+              data = work_mod,
+              family = sm.families.Binomial()).fit()
+
+# Step 2: Predict probabilities
+mod.summary()
+work_mod['pred_prob'] = mod.predict(work_mod)
+
+
+# Step 3: Plot
+pn.ggplot.show(
+    pn.ggplot(work_mod, pn.aes(x = var, y = 'pred_prob'))
+    + pn.geom_point(alpha = 0.3)
+    + pn.geom_line(color = 'dodgerblue', size = 1.2)
+    + pn.scale_y_continuous(limits = {0, 1})
+    + pn.facet_wrap(mod1)
+    #+ pn.facet_grid(mod1, mod2)
+)
+
+def poly(x, degree=1):
+    """
+    Fit Polynomial
+
+    These are non orthogonal factors, but it may not matter if
+    we only need this for smoothing and not extrapolated
+    predictions.
+    """
+    d = {}
+    for i in range(degree+1):
+        if i == 1:
+            d['x'] = x
+        else:
+            d[f'x**{i}'] = np.power(x, i)
+    return pd.DataFrame(d)
+
+pn.ggplot.show(
+  pn.ggplot(work_mod, pn.aes('lap_min', 'position_bi'))
+  + pn.geom_point(alpha = .3)
+  + pn.stat_smooth(method = 'lm',
+  se = False,
+  formula = 'y ~ poly(x, degree = 3)')
+)
+
+(
+  print(
+    work_mod[[var, mod1, mod2, 'position_bi']]
+    .corr()
+  )
+)
+```
+
+```{python}
+#| eval: false
+#| echo: false
+
+x_corr = x.corr()
+
+x_corr.columns
+
+x8 = x_corr[(abs(x_corr) > .8)]
+x8.columns.tolist()
+
+x8 = x8.replace(1, np.nan)
+x8 = x8.dropna(how = 'all')
+
+x8
+
+# multicollinearity
+# lap_number - interval, time_min
+# has_pit_out - pit_out_time_min
+# pit_delta - pit_in_time_shift_min
+# air_temp - humidity, track_temp
+# pressure - race ???
+# position - race
+# speed i1 - sector 2 sec, lap min
+# speed i2 - sector 2 sec
+# sector 1 sec - lap min
+# sector 2 sec - lap min
+# sector 3 sec - lap min
+# lap min - r, interval
+# fp3 - rain
+# race - interval
+# hard - race
+```
+
+```{python}
+from sklearn.pipeline import make_pipeline, Pipeline
+from sklearn.preprocessing import StandardScaler, SplineTransformer, PolynomialFeatures
+from sklearn.linear_model import LogisticRegression, SGDClassifier as sgd
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.metrics import accuracy_score, roc_auc_score, mean_absolute_error, roc_curve, precision_score, recall_score, log_loss, confusion_matrix, balanced_accuracy_score, ConfusionMatrixDisplay
+
+x.columns
+
+x = work_mod.drop(columns = 'position_bi')
+y = work_mod['position_bi']
+
+x['r_x_stint'] = x['Stint']*x['r']
+x['stint_x_polestitter'] = x['Stint']*x['pole_sitter']
+x['r_x_stint_x_polesitter'] = x['Stint']*x['r']*x['pole_sitter']
+x['hard_x_tirelife'] = x['hard']*x['TyreLife']
+x['medium_x_tirelife'] = x['medium']*x['TyreLife']
+x['inter_x_tirelife'] = x['intermediate']*x['TyreLife']
+x['wet_x_tirelife'] = x['wet']*x['TyreLife']
+x['lap_min_x_r'] = x['lap_min']*x['r']
+
+#x['sector1_x_speedi1'] = x['SpeedI1']*x['sector1_sec']
+#x['sector2_x_speedi2'] = x['SpeedI2']*x['sector2_sec']
+#x['sector3_x_speedFL'] = x['SpeedFL']*x['sector3_sec']
+
+x_final = x.drop(columns = ['pit_delta'])
+x_final.columns
+
+#x_array = np.array(x)
+#y_array = np.array(y).reshape(-1, 1)
+
+#preprocess = ColumnTransformer([
+#    ('splines', SplineTransformer(n_knots = 4, degree = 3, include_bias = False), x_spline),
+#    ('scale', StandardScaler(), numeric_features)
+#])
+
+pipe = (
+  Pipeline([
+    ('scaler',
+      StandardScaler(),
+    ),
+    ('log_model',
+    sgd(loss = 'log_loss',
+      penalty = None,
+      class_weight = 'balanced',
+      random_state = 14042025,
+      max_iter = 10000,
+      verbose = 2,
+      n_jobs = 10,
+      validation_fraction = .2,
+      n_iter_no_change = 10)
+    )])
+)
+
+pipe.fit(x_final, y)
+#pipe.score(x, y)
+#pipe.get_params
+
+log_pred_prob = pipe.predict_proba(x_final)[:, 1]
+log_pred = np.where(log_pred_prob >= .5, 1, 0)
+
+print(accuracy_score(y, log_pred))
+print(roc_auc_score(y, log_pred))
+print(precision_score(y, log_pred))
+print(recall_score(y, log_pred))
+
+cm = confusion_matrix(y, log_pred, labels = pipe.classes_)
+print(cm)
+
+def youden_index_calc(confuse_matrix):
+  tn = confuse_matrix[0, 0]
+  fn = confuse_matrix[1, 0]
+  tp = confuse_matrix[1, 1]
+  fp = confuse_matrix[0, 1]
+
+  top = (tp * tn) - (fp * fn)
+  bottom = (tp + fn) * (tn + fp)
+
+  j = top/bottom
+
+  return round(j, 4)
+
+youden_index_calc(cm)
+
+log_pred_up = np.where(log_pred_prob >= youden_index_calc(cm), 1, 0)
+
+print(accuracy_score(y, log_pred_up))
+print(roc_auc_score(y, log_pred_up))
+print(precision_score(y, log_pred_up))
+print(recall_score(y, log_pred_up))
+confusion_matrix(y, log_pred_up, labels = pipe.classes_)
+
+(
+  ConfusionMatrixDisplay(
+    confusion_matrix = confusion_matrix(y, log_pred_up, labels = pipe.classes_), display_labels = pipe.classes_)
+    .plot()
+)
+
+#log_model_step = pipe.named_steps['log_model']
+#
+#from great_tables import GT as gt
+#gt(
+#  pd.DataFrame({'var_names': x_final.columns, 'coef': pd.DataFrame(log_model_step.coef_).melt().iloc[:, 1].round(2)})
+#)
+```
+
+```{python}
+grid_pipe = (
+  Pipeline([
+    ('scaler',
+      StandardScaler()),
+    ('log_model',
+    sgd(
+      class_weight = 'balanced',
+      random_state = 14042025,
+      max_iter = 10000,
+      verbose = 2,
+      n_jobs = 10,
+      validation_fraction = .2,
+      n_iter_no_change = 10))
+    ])
+)
+
+log_param_grid = [
+  #alpha when learning rate is optimal
+    {'log_model__learning_rate': ['optimal'],
+      'log_model__alpha': [.0001, .00001],
+      'log_model__penalty': ['elasticnet'],
+      'log_model__l1_ratio': [np.arange(0, 1.01, .05)]},
+    {'log_model__learning_rate': ['optimal'],
+      'log_model__alpha': [.001, .0001, .00001],
+      'log_model__penalty': ['l2', 'l1']},
+
+    #check out other learning rates
+    {'log_model__learning_rate': ['constant', 'invscaling', 'adaptive'],
+      'log_model__eta0': [np.arange(0, 1.01, .1)],
+      'log_model__penalty': ['elasticnet'],
+      'log_model__l1_ratio': [np.arange(0, 1.01, .05)]},
+    {'log_model__learning_rate': ['constant', 'invscaling', 'adaptive'],
+      'log_model__eta0': [np.arange(0, 1.01, .1)],
+      'log_model__penalty': ['l2']}
+]
+
+scv = (
+  StratifiedKFold(
+    n_splits = 10,
+    shuffle = True,
+    random_state = 14042025
+    )
+)
+
+grid_search = (
+  GridSearchCV(
+    grid_pipe,
+    param_grid = log_param_grid,
+    cv = scv,
+    scoring = 'recall',
+    verbose = 2
+  )
+)
+
+grid_search.fit(x_final, y)
+
+print(grid_search.best_score_)
+print(grid_search.best_params_)
+#print(grid_search.best_estimator_)
+```
+
+```{python}
+final_pipe = (
+  Pipeline([
+    (
+      'scaler',
+      StandardScaler(),
+    ),
+    (
+      'log_model',
+      sgd(
+        loss = 'log_loss',
+        penalty = 'l2',
+        class_weight = 'balanced',
+        random_state = 14042025,
+        max_iter = 10000,
+        verbose = 2,
+        n_jobs = 10,
+        validation_fraction = .2,
+        n_iter_no_change = 10,
+        alpha = .0001,
+        learning_rate = 'optimal'
+        )
+      )
+    ])
+)
+
+final_pipe.fit(x_final, y)
+#final_pipe.score(x, y)
+#final_pipe.get_params
+
+log_pred_final_prob = final_pipe.predict_proba(x_final)[:, 1]
+log_pred_final = np.where(log_pred_final_prob >= .5, 1, 0)
+cm_final = confusion_matrix(y, log_pred_final, labels = final_pipe.classes_)
+
+log_pred_final_up = np.where(log_pred_final_prob >= youden_index_calc(cm_final), 1, 0)
+
+print(accuracy_score(y, log_pred_final_up))
+print(roc_auc_score(y, log_pred_final_up))
+print(precision_score(y, log_pred_final_up))
+print(recall_score(y, log_pred_final_up))
+
+cm_final_up = confusion_matrix(y, log_pred_final_up, labels = final_pipe.classes_)
+print(cm_final_up)
+
+def confuse_matrix_perc(confuse_matrix):
+  tn = confuse_matrix[0, 0]
+  fn = confuse_matrix[1, 0]
+  tp = confuse_matrix[1, 1]
+  fp = confuse_matrix[0, 1]
+
+  total = tn + fn + tp + fp
+  tnp = round(tn/total, 3)*100
+  fnp = round(fn/total, 3)*100
+  tpp = round(tp/total, 3)*100
+  fpp = round(fp/total, 3)*100
+  
+  return pd.DataFrame({
+    'Names': ['True Negative', 'False Negative', 'True Positive', 'False Positive'],
+    'Percentage': [tnp, fnp, tpp, fpp]
+    })
+
+confuse_matrix_perc(cm_final_up)
+
+(
+  ConfusionMatrixDisplay(confusion_matrix = cm_final_up, 
+  display_labels = pipe.classes_)
+  .plot()
+)
+
+# log_model_step_final = final_pipe.named_steps['log_model']
+# 
+# gt(
+#   pd.DataFrame({
+#   'var_names': x_final.columns,
+#   'coef': pd.DataFrame(log_model_step_final.coef_).melt().iloc[:, 1].round(2)
+#   })
+# )
+
+```
+
+```{python}
+from sklearn.inspection import permutation_importance
+
+important = (
+  permutation_importance(
+    final_pipe, 
+    x_final, 
+    y, 
+    n_repeats = 20,
+    n_jobs = 10,
+    random_state = 14042025)
+)
+
+important_df = (
+  pd
+  .DataFrame({'var_names': x_final.columns,
+  'importance_mean': important.importances_mean})
+  .sort_values('importance_mean', ascending = False)
+)
+
+pn.ggplot.show(
+  pn.ggplot(important_df, pn.aes('var_names', 'importance_mean'))
+  + pn.geom_col(fill = 'dodgerblue', color = 'black')
+  + pn.coord_flip()
+  + pn.theme_light()
+)
+```
+
+```{python}
+test = model_laps.loc[(model_laps['year'] == 2024)]
+test['position_bi'] = np.where(test['Position'] == 1, 1, 0)
+
+test = test.loc[:, ['LapNumber', 'year', 'Stint',
+'TyreLife', 'pit_delta', 'Humidity', 'TrackTemp',
+'WindSpeed', 'SpeedI1', 'SpeedI2', 'SpeedFL',
+'SpeedST', 'sector1_sec', 'sector2_sec', 'sector3_sec',
+'lap_min', 'pole_sitter', 'session',
+'hard', 'intermediate', 'medium', 'soft', 'wet', 'fresh_tires',
+'rain', 'position_bi']]
+test = test.dropna()
+
+test['session_up'] = (
+  np.select(
+    [
+      (test['session'].isin(['fp1', 'fp2', 'fp3'])),
+      (test['session'] == 'q'),
+      (test['session'] == 'r')
+    ],
+    ['fp', 'q', 'r'],
+    default = 'fp'
+  ).astype('object')
+)
+
+test[['fp', 'q', 'r']] = pd.get_dummies(test['session_up'], dtype = 'float64')
+
+test = test.drop(columns = ['session', 'session_up', 'fp', 'Humidity', 'soft', 'TrackTemp'])
+
+x_test = test.drop(columns = ['position_bi', 'pit_delta'])
+y_test = test['position_bi']
+
+x_test['r_x_stint'] = x_test['Stint']*x_test['r']
+x_test['stint_x_polestitter'] = x_test['Stint']*x_test['pole_sitter']
+x_test['r_x_stint_x_polesitter'] = x_test['Stint']*x_test['r']*x_test['pole_sitter']
+x_test['hard_x_tirelife'] = x_test['hard']*x_test['TyreLife']
+x_test['medium_x_tirelife'] = x_test['medium']*x_test['TyreLife']
+x_test['inter_x_tirelife'] = x_test['intermediate']*x_test['TyreLife']
+x_test['wet_x_tirelife'] = x_test['wet']*x_test['TyreLife']
+x_test['lap_min_x_r'] = x_test['lap_min']*x_test['r']
+
+final_pipe.fit(x_test, y_test)
+
+log_pred_prob_test = final_pipe.predict_proba(x_test)[:, 1]
+log_pred_test = np.where(log_pred_prob_test >= .5, 1, 0)
+
+cm_test = confusion_matrix(y_test, log_pred_test, labels = final_pipe.classes_)
+print(cm_test)
+
+log_pred_test_up = np.where(log_pred_prob_test >= youden_index_calc(cm_test), 1, 0)
+
+print(accuracy_score(y_test, log_pred_test_up))
+print(roc_auc_score(y_test, log_pred_test_up))
+print(precision_score(y_test, log_pred_test_up))
+print(recall_score(y_test, log_pred_test_up))
+
+cm_test_up = confusion_matrix(y_test, log_pred_test_up, labels = final_pipe.classes_)
+print(cm_test_up)
+
+confuse_matrix_perc(cm_test_up)
+
+(
+  ConfusionMatrixDisplay(confusion_matrix = cm_test_up, 
+  display_labels = pipe.classes_)
+  .plot()
+)
+
+log_model_step_test = final_pipe.named_steps['log_model']
+
+gt(
+  pd.DataFrame({
+  'var_names': x_test.columns,
+  'coef': pd.DataFrame(log_model_step_test.coef_).melt().iloc[:, 1].round(2)
+  })
+)
+
+```
