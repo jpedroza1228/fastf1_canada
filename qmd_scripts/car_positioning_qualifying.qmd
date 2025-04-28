@@ -1,0 +1,141 @@
+---
+title: "Untitled"
+format: html
+---
+
+```{python}
+#| tags: [parameters]
+
+track_loc = 'Canada'
+track_loc = track_loc.lower()
+```
+
+# Loading Data
+
+```{python}
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotnine as pn
+import seaborn as sns
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+pd.set_option('mode.copy_on_write', True)
+pd.set_option('display.max_columns', None)
+rcParams.update({'savefig.bbox': 'tight'})
+```
+
+# Car Data
+
+```{python}
+cardata = pq.read_table(f'data/{track_loc}_cardata.parquet')
+cardata = cardata.to_pandas()
+
+cardata = cardata.drop(columns = ['date_sec', 'time_sec', 'session_time_sec'])
+
+cardata['time_sec'] = cardata['Time'].dt.total_seconds()
+cardata['session_time_sec'] = cardata['SessionTime'].dt.total_seconds()
+cardata['date'] = cardata['Date'].dt.date
+cardata['time'] = cardata['Date'].dt.time
+
+cardata = cardata.drop(columns = ['Date', 'Time', 'SessionTime'])
+```
+
+# POS Data
+
+```{python}
+pos = pq.read_table(f'data/{track_loc}_pos.parquet')
+pos = pos.to_pandas()
+
+pos = pos.drop(columns = ['date_sec', 'time_sec', 'session_time_sec'])
+
+pos['date'] = pos['Date'].dt.date
+pos['time'] = pos['Date'].dt.time
+pos['time_sec'] = pos['Time'].dt.total_seconds()
+pos['session_time_sec'] = pos['SessionTime'].dt.total_seconds()
+
+pos = pos.drop(columns = ['Date', 'Time', 'SessionTime'])
+```
+
+# Track Corners Data
+
+```{python}
+corner = pq.read_table(f'data/track_corners.parquet')
+corner = corner.to_pandas()
+
+corner.head()
+```
+
+# Car Position on Track When Entering Turn
+
+```{python}
+pos_corner = pos.merge(corner, 'left', ['X', 'Y'])
+pos_corner = pos_corner.round(1)
+
+pos_corner['turn_coord'] = np.where(pos_corner['Number'].isna(), 0, 1)
+
+cardata = cardata.round(1)
+
+# Only Looking at Data For Qualifying
+pos_corner_q = pos_corner.loc[pos_corner['session'] == 'q']
+cardata_q = cardata.loc[cardata['session'] == 'q']
+
+pos_corner_q.shape
+cardata_q.shape
+
+pos_corner_q.columns.tolist()
+cardata_q.columns.tolist()
+
+pos_corner_q.head()
+cardata_q.head()
+
+car_pos_corn_q = pos_corner_q.merge(cardata_q, 'left', ['session', 'time_sec', 'session_time_sec', 'driver_number'])
+
+car_pos_corn_q.head()
+
+car_pos_corn_q = car_pos_corn_q.dropna(subset = ['RPM', 'Speed', 'nGear', 'Throttle'])
+
+
+
+car_pos_corn_q.loc[(car_pos_corn_q['Number'] == 1)]
+```
+
+```{python}
+#| eval: false
+#| echo: false
+
+import fastf1
+
+gp_24 = fastf1.get_session(2024, track_loc, 'R')
+gp_24.load()
+track_layout = gp_24.get_circuit_info()
+
+def rotate(xy, *, angle):
+    """Rotate a DataFrame or Series of x/y points."""
+    rot_mat = np.array([[np.cos(angle), np.sin(angle)],
+                        [-np.sin(angle), np.cos(angle)]])
+    # xy can be a DataFrame (n, 2) or Series/list (2,)
+    if isinstance(xy, pd.DataFrame):
+        return xy @ rot_mat
+    else:  # assume it's Series or list-like with 2 elements
+        return pd.Series(xy) @ rot_mat
+
+track_pos = pos.loc[(pos['driver_number'] == '1'), ('X', 'Y')]
+
+track_angle = track_layout.rotation / 180 * np.pi
+
+rotated_track = rotate(track_pos, angle = track_angle)
+
+rotated_track = rotated_track.loc[(rotated_track[0] != 0) & (rotated_track[1] != 0)]
+rotated_track['X'] = rotated_track[0]
+rotated_track['Y'] = rotated_track[1]
+rotated_track = rotated_track.drop(columns = [0, 1])
+
+pn.ggplot.show(
+  pn.ggplot(rotated_track, pn.aes('X', 'Y'))
+  + pn.geom_path()
+) 
+```
